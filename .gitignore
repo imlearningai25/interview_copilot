@@ -1,0 +1,6 @@
+.env
+venv
+*.log
+interview_copilot/*.*
+job_config.json
+frontend/node_modules

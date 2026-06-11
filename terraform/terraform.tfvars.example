@@ -1,0 +1,18 @@
+# Copy to terraform.tfvars and fill in real values.
+# Never commit terraform.tfvars to git (add to .gitignore).
+
+project_id  = "your-gcp-project-id"
+region      = "us-central1"
+environment = "prod"
+image_tag   = "latest"
+
+# Cloud SQL
+db_tier     = "db-n1-standard-2"   # db-f1-micro for dev
+db_password = "CHANGE_ME"          # use Secret Manager in real deployments
+
+# Scaling
+backend_max_instances  = 10
+frontend_max_instances = 5
+
+# Optional custom domain (leave "" to use *.run.app URLs)
+domain = ""

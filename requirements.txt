@@ -1,0 +1,16 @@
+# Interview Copilot — Python dependencies
+#
+# Install everything at once:
+#   pip install -r requirements.txt
+#
+# Platform notes for PyAudio:
+#   macOS:   brew install portaudio   (then pip install pyaudio)
+#   Windows: pip install pyaudio      (usually works directly)
+#   Linux:   sudo apt install python3-pyaudio portaudio19-dev
+
+anthropic>=0.25.0
+SpeechRecognition>=3.10.0
+pyaudio>=0.2.13
+flask>=3.0.0
+python-dotenv>=1.0.0
+pynput>=1.7.0

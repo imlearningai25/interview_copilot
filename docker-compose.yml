@@ -1,0 +1,58 @@
+version: '3.9'
+
+services:
+  # ── PostgreSQL — host port 4000 ───────────────────────────
+  db:
+    image: postgres:15-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER:     ${POSTGRES_USER:-copilot}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-copilot_dev}
+      POSTGRES_DB:       ${POSTGRES_DB:-copilot_db}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "${POSTGRES_PORT:-4000}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-copilot} -d ${POSTGRES_DB:-copilot_db}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ── FastAPI backend — host port 4001 ──────────────────────
+  backend:
+    build:
+      context: ./backend
+      target: development
+    restart: unless-stopped
+    environment:
+      DATABASE_URL:       postgresql://${POSTGRES_USER:-copilot}:${POSTGRES_PASSWORD:-copilot_dev}@db:5432/${POSTGRES_DB:-copilot_db}
+      CORS_ORIGINS:       ${CORS_ORIGINS:-http://localhost:4002,http://localhost:80}
+      ENVIRONMENT:        ${ENVIRONMENT:-development}
+      ANTHROPIC_API_KEY:  ${ANTHROPIC_API_KEY:-}
+    volumes:
+      - ./backend:/app
+    ports:
+      - "${BACKEND_PORT:-4001}:4001"
+    depends_on:
+      db:
+        condition: service_healthy
+
+  # ── React frontend — host port 4002 ───────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      target: development
+    restart: unless-stopped
+    environment:
+      VITE_API_URL: ${VITE_API_URL:-http://localhost:4001}
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules        # preserve container's node_modules
+    ports:
+      - "${FRONTEND_PORT:-4002}:4002"
+    depends_on:
+      - backend
+
+volumes:
+  postgres_data:
