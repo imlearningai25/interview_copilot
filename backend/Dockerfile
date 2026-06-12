@@ -33,5 +33,5 @@ COPY . .
 RUN adduser --disabled-password --gecos "" appuser && chown -R appuser /app
 USER appuser
 
-EXPOSE 4001
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "4001", "--workers", "2"]
+EXPOSE 8080
+CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8080} --workers 2"]

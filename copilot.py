@@ -16,7 +16,6 @@ import os
 import json
 import re
 import queue
-import subprocess
 import threading
 import tkinter as tk
 from tkinter import scrolledtext
@@ -100,6 +99,7 @@ CONFIG = {
     "font_size":        int(os.getenv("COPILOT_FONT_SIZE",    "11")),
     "theme":            os.getenv("COPILOT_THEME",            "dark"),
     "always_on_top":    _bool(os.getenv("COPILOT_ALWAYS_ON_TOP", "true")),
+    "vosk_model_path":  os.getenv("COPILOT_VOSK_MODEL_PATH", ""),
 }
 
 # Coaching prompt — pre-loaded with Niraj Byanjankar's resume
@@ -284,6 +284,117 @@ class AudioListener:
                     pass
 
 
+# ─── Vosk real-time audio listener ───────────────────────────
+
+def _find_vosk_model(config: dict) -> str:
+    """Return path to a Vosk model directory, or '' if none found."""
+    explicit = config.get("vosk_model_path", "").strip()
+    if explicit and os.path.isdir(explicit):
+        return explicit
+    base = os.path.dirname(os.path.abspath(__file__))
+    for name in (
+        "vosk-model-small-en-us-0.15",
+        "vosk-model-small-en-us-0.22",
+        "vosk-model-en-us-0.22",
+        "vosk-model-en-us-0.42-gigaspeech",
+    ):
+        path = os.path.join(base, name)
+        if os.path.isdir(path):
+            return path
+    return ""
+
+
+class VoskAudioListener:
+    """Real-time mic listener using Vosk (offline STT).
+
+    Emits ("partial", text) for in-progress speech so the HEARD panel
+    updates word-by-word, and ("transcript", text) when a phrase completes.
+    Falls back gracefully if vosk or pyaudio is missing.
+
+    The Vosk model is loaded once at construction time in a background thread
+    so the first start() call is instant.
+    """
+
+    RATE  = 16_000
+    CHUNK = 4_000   # 250 ms of audio per read
+
+    def __init__(self, out_q: queue.Queue, config: dict, model_path: str):
+        self.q           = out_q
+        self.cfg         = config
+        self.model_path  = model_path
+        self._running    = False
+        self._paused     = False
+        self._thread     = None
+        self._model      = None   # loaded once in background at init
+        # Pre-load so the first start() isn't slow
+        threading.Thread(target=self._preload, daemon=True).start()
+
+    def _preload(self):
+        try:
+            from vosk import Model
+            self._model = Model(self.model_path)
+        except Exception:
+            pass  # error surfaced in _loop when start() is called
+
+    def start(self):
+        self._running = True
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._running = False
+
+    def pause(self):
+        self._paused = True
+
+    def resume(self):
+        self._paused = False
+
+    def _loop(self):
+        try:
+            from vosk import Model, KaldiRecognizer
+        except ImportError:
+            self.q.put(("error", "vosk not installed.\nRun:  pip install vosk"))
+            return
+        try:
+            import pyaudio as _pa
+        except ImportError:
+            self.q.put(("error", "pyaudio not installed.\nRun:  pip install pyaudio"))
+            return
+        import json as _json
+
+        # Use cached model; fall back to synchronous load if preload didn't finish
+        if self._model is None:
+            self._model = Model(self.model_path)
+
+        # New KaldiRecognizer each start() so state is clean
+        rec    = KaldiRecognizer(self._model, self.RATE)
+        pa     = _pa.PyAudio()
+        stream = pa.open(
+            format=_pa.paInt16, channels=1, rate=self.RATE,
+            input=True, frames_per_buffer=self.CHUNK,
+        )
+        try:
+            while self._running:
+                data = stream.read(self.CHUNK, exception_on_overflow=False)
+                # Always feed audio to keep recognizer state current,
+                # even when paused — just suppress the emitted events.
+                if rec.AcceptWaveform(data):
+                    if not self._paused:
+                        text = _json.loads(rec.Result()).get("text", "").strip()
+                        if text:
+                            self.q.put(("transcript", text))
+                else:
+                    if not self._paused:
+                        text = _json.loads(rec.PartialResult()).get("partial", "").strip()
+                        if text:
+                            self.q.put(("partial", text + "…"))
+        finally:
+            stream.stop_stream()
+            stream.close()
+            pa.terminate()
+
+
 # ─── Question detection ───────────────────────────────────────
 # Matches question phrases anywhere in the sentence (handles openers like
 # "let's move on...", "so...", "I'd like to know..." before the actual ask).
@@ -358,6 +469,8 @@ class AIWorker:
                     self.oq.put(("stream_start", content))
                     get_ai_response(content, self.cfg, on_chunk=lambda t: self.oq.put(("chunk", t)))
                     self.oq.put(("stream_done", None))
+                elif kind == "partial":
+                    self.oq.put(("partial", content))
                 elif kind == "error":
                     self.oq.put(("error", content))
             except queue.Empty:
@@ -375,7 +488,11 @@ class CopilotOverlay:
         self.transcript_q: queue.Queue = queue.Queue()   # AudioListener → AIWorker
         self.response_q:   queue.Queue = queue.Queue()   # AIWorker → UI
 
-        self.listener  = AudioListener(self.transcript_q, config)
+        vosk_path = _find_vosk_model(config)
+        if vosk_path:
+            self.listener = VoskAudioListener(self.transcript_q, config, vosk_path)
+        else:
+            self.listener = AudioListener(self.transcript_q, config)
         self.ai_worker = AIWorker(self.transcript_q, self.response_q, config)
         self._listening = False
 
@@ -571,7 +688,7 @@ class CopilotOverlay:
         threading.Thread(target=self._run_manual_ai, args=(text,), daemon=True).start()
 
     def _run_manual_ai(self, text: str):
-        self.response_q.put(("stream_clear", None))
+        self.response_q.put(("stream_start", text))
         self.root.after(0, self._drain_once)
 
         def on_chunk(chunk):
@@ -594,12 +711,12 @@ class CopilotOverlay:
                 kind, payload = self.response_q.get_nowait()
                 if kind == "stream_start":
                     self._set_heard(payload)
-                    self._set_answer("")
+                    self._append_divider(payload)
                     self._set_status("🤔  Thinking…", "yellow")
-                elif kind == "stream_clear":
-                    self._set_answer("")
                 elif kind == "chunk":
                     self._append_answer(payload)
+                elif kind == "partial":
+                    self._set_heard(payload)
                 elif kind == "not_question":
                     self._set_heard(payload)
                     self._set_status("🎤  Listening…", "green")
@@ -626,6 +743,32 @@ class CopilotOverlay:
         self.heard_txt.insert("end", text)
         self.heard_txt.config(state="disabled")
 
+    def _append_divider(self, question: str):
+        self.answer_txt.config(state="normal")
+        old = self.answer_txt.get("1.0", "end-1c").strip()
+        self.answer_txt.delete("1.0", "end")
+
+        divider = "─" * 38
+
+        if old:
+            # Insert old history first, then put the new header above it.
+            # This way the mark (set after both inserts) sits at a fixed
+            # position between the header and the old block — RIGHT gravity
+            # then lets each streaming chunk land to the LEFT of the mark
+            # (before it), advancing the mark downward in correct order.
+            self.answer_txt.insert("1.0", "\n" + divider + "\n" + old)
+            self.answer_txt.insert("1.0", divider + "\nQ: " + question + "\n\n")
+            # Header occupies lines 1-3 (divider / Q: / blank).
+            # Line 4 is the blank line that precedes the old-history separator.
+            self.answer_txt.mark_set("stream_here", "4.0")
+        else:
+            self.answer_txt.insert("1.0", divider + "\nQ: " + question + "\n\n")
+            self.answer_txt.mark_set("stream_here", "end")
+
+        self.answer_txt.mark_gravity("stream_here", "right")
+        self.answer_txt.see("1.0")
+        self.answer_txt.config(state="disabled")
+
     def _set_answer(self, text: str):
         self.answer_txt.config(state="normal")
         self.answer_txt.delete("1.0", "end")
@@ -634,8 +777,13 @@ class CopilotOverlay:
 
     def _append_answer(self, text: str):
         self.answer_txt.config(state="normal")
-        self.answer_txt.insert("end", text)
-        self.answer_txt.see("end")
+        try:
+            self.answer_txt.insert("stream_here", text)
+            self.answer_txt.see("stream_here")
+        except tk.TclError:
+            # mark missing (e.g. after a manual clear) — fall back to end
+            self.answer_txt.insert("end", text)
+            self.answer_txt.see("end")
         self.answer_txt.config(state="disabled")
 
     def _clear(self):
@@ -697,13 +845,12 @@ class CopilotOverlay:
         self.listen_btn.config(text="▶  Start Listening", bg=self.c["green"])
         self._set_status("✅  Answer ready — press any key to listen again", "green")
 
-    # ── Global keyboard toggle + 8s kill switch ───────────────
+    # ── Global keyboard toggle ────────────────────────────────
     def _start_keyboard_listener(self):
         if not _HAS_PYNPUT:
             return
 
         _held = set()
-        _hold_timer = [None]    # list so the nested functions can rebind it
 
         def _key_id(key):
             try:
@@ -711,62 +858,20 @@ class CopilotOverlay:
             except AttributeError:
                 return str(key)
 
-        def _fire_shutdown():
-            self.root.after(0, self._shutdown_all)
-
         def _on_press(key):
             kid = _key_id(key)
             if kid in _held:
                 return              # key-repeat — ignore
             _held.add(kid)
-            # Start the 8-second kill-switch timer
-            t = threading.Timer(8.0, _fire_shutdown)
-            t.daemon = True
-            t.start()
-            _hold_timer[0] = t
             self.root.after(0, self._keyboard_toggle)
 
         def _on_release(key):
             _held.discard(_key_id(key))
-            if _hold_timer[0]:
-                _hold_timer[0].cancel()
-                _hold_timer[0] = None
 
         self._kb_listener = _kb.Listener(
             on_press=_on_press, on_release=_on_release, daemon=True
         )
         self._kb_listener.start()
-
-    def _shutdown_all(self):
-        """Kill switch: stop docker services, launcher, and this window."""
-        self._set_status("Shutting down everything…", "red")
-        self.root.update()
-
-        # 1. Stop docker compose (takes down ports 4002 + 4001)
-        try:
-            subprocess.Popen(
-                ["docker", "compose", "stop"],
-                cwd=os.path.dirname(os.path.abspath(__file__)),
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-        except Exception:
-            pass
-
-        # 2. Signal launcher to exit (takes down port 4004)
-        try:
-            launcher_port = os.getenv("LAUNCHER_PORT", "4004")
-            req = urllib.request.Request(
-                f"http://localhost:{launcher_port}/shutdown",
-                data=b"",
-                method="POST",
-            )
-            urllib.request.urlopen(req, timeout=2)
-        except Exception:
-            pass
-
-        # 3. Close this window
-        self._quit()
 
     def _keyboard_toggle(self):
         # Don't toggle while a dialog (Toplevel) is open — user may be typing
@@ -774,7 +879,6 @@ class CopilotOverlay:
             if isinstance(w, tk.Toplevel) and w.winfo_exists():
                 return
         self._set_heard("")
-        self._set_answer("")
         self._toggle_listen()
 
     # ── Lifecycle ─────────────────────────────────────────────
@@ -812,11 +916,22 @@ def main():
         print("    You can still use 'Type Question' mode.")
         print("    Set it with:  export ANTHROPIC_API_KEY=sk-ant-...\n")
 
-    try:
-        import speech_recognition as _sr_check; del _sr_check
-    except ImportError:
-        print("⚠   speech_recognition not found — voice mode disabled.")
-        print("    Run:  pip install SpeechRecognition pyaudio\n")
+    vosk_path = _find_vosk_model(CONFIG)
+    if vosk_path:
+        print(f"\n  ✓ Vosk model found — real-time transcription enabled")
+        print(f"    {vosk_path}")
+    else:
+        print("\n  ℹ  No Vosk model found — using Google Speech Recognition (phrase-complete only).")
+        print("     For real-time word-by-word transcription:")
+        print("     1. pip install vosk")
+        print("     2. Download a model from https://alphacephei.com/vosk/models")
+        print("        e.g. vosk-model-small-en-us-0.15  (40 MB, fast)")
+        print("     3. Unzip into this directory (or set COPILOT_VOSK_MODEL_PATH)")
+        try:
+            import speech_recognition as _sr_check; del _sr_check
+        except ImportError:
+            print("\n⚠   speech_recognition not found — voice mode disabled.")
+            print("    Run:  pip install SpeechRecognition pyaudio\n")
 
     app = CopilotOverlay(CONFIG)
     app.run()

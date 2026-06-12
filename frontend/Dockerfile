@@ -26,7 +26,9 @@ RUN npm run build
 FROM nginx:alpine AS production
 
 COPY --from=builder /app/dist /usr/share/nginx/html
-COPY nginx.conf /etc/nginx/conf.d/default.conf
+COPY nginx.prod.conf.template /etc/nginx/conf.d/default.conf.template
 
-EXPOSE 3000
-CMD ["nginx", "-g", "daemon off;"]
+EXPOSE 8080
+# envsubst substitutes only ${PORT} and ${BACKEND_URL}, leaving nginx
+# variables like $uri and $host untouched.
+CMD ["/bin/sh", "-c", "envsubst '${PORT} ${BACKEND_URL}' < /etc/nginx/conf.d/default.conf.template > /etc/nginx/conf.d/default.conf && nginx -g 'daemon off;'"]

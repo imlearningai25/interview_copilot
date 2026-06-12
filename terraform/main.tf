@@ -12,11 +12,11 @@ terraform {
     }
   }
 
-  # Remote state — replace bucket with your GCS bucket name
-  backend "gcs" {
-    bucket = "REPLACE_WITH_YOUR_TF_STATE_BUCKET"
-    prefix = "interview-copilot/terraform/state"
-  }
+  # Remote state — uncomment and set bucket name when ready for production
+  # backend "gcs" {
+  #   bucket = "REPLACE_WITH_YOUR_TF_STATE_BUCKET"
+  #   prefix = "interview-copilot/terraform/state"
+  # }
 }
 
 provider "google" {
@@ -55,7 +55,9 @@ resource "google_artifact_registry_repository" "app" {
 # ── Secret Manager — DB password ──────────────────────────────
 resource "google_secret_manager_secret" "db_password" {
   secret_id = "copilot-db-password"
-  replication { auto {} }
+  replication {
+    auto {}
+  }
   depends_on = [google_project_service.apis]
 }
 

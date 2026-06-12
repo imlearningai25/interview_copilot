@@ -1,6 +1,33 @@
+# Secrets / local config
 .env
-venv
-*.log
-interview_copilot/*.*
 job_config.json
-frontend/node_modules
+
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.pytest_cache/
+
+# Logs
+*.log
+copilot.log
+
+# Vosk models — large binary files, download separately
+vosk-model-*/
+
+# Frontend
+frontend/node_modules/
+
+# Terraform — state and tfvars contain secrets in plain text, never commit them
+terraform/.terraform/
+terraform/terraform.tfvars
+terraform/terraform.tfstate
+terraform/terraform.tfstate.backup
+terraform/*.tfplan
+terraform/crash.log
+# NOTE: terraform/.terraform.lock.hcl SHOULD be committed (locks provider versions)
+
+interview_copilot/*.*

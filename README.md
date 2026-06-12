@@ -196,7 +196,7 @@ echo -n "sk-ant-...your-key..." | \
 
 ```bash
 # Set your Artifact Registry URL (output from terraform apply)
-export REGISTRY=us-east1-docker.pkg.dev/YOUR_PROJECT_ID/interview-copilot
+export REGISTRY=us-central1-docker.pkg.dev/this-terraform/interview-copilot
 
 # Build and push backend
 docker build -t $REGISTRY/backend:latest ./backend

@@ -26,6 +26,15 @@ resource "google_cloud_run_v2_service" "backend" {
         name  = "ENVIRONMENT"
         value = var.environment
       }
+      env {
+        name = "ANTHROPIC_API_KEY"
+        value_source {
+          secret_key_ref {
+            secret  = "interview-copilot-api-key"
+            version = "latest"
+          }
+        }
+      }
 
       resources {
         limits = {
@@ -77,10 +86,15 @@ resource "google_cloud_run_v2_service" "frontend" {
     containers {
       image = "${var.registry_url}/frontend:${var.image_tag}"
 
+      env {
+        name  = "BACKEND_URL"
+        value = google_cloud_run_v2_service.backend.uri
+      }
+
       resources {
         limits = {
           cpu    = "1"
-          memory = "256Mi"
+          memory = "512Mi"
         }
       }
     }
