@@ -5,7 +5,7 @@
  * and all request paths are relative (e.g. /api/jobs).
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { jobsApi } from '../api'
+import { jobsApi, sessionsApi } from '../api'
 
 const MOCK_JOB = {
   id: 1,
@@ -107,6 +107,82 @@ describe('jobsApi.activate', () => {
     expect(fetch).toHaveBeenCalledWith(
       '/api/jobs/1/activate',
       expect.objectContaining({ method: 'PATCH' }),
+    )
+  })
+})
+
+// ── sessionsApi ───────────────────────────────────────────────
+
+const MOCK_SESSION = {
+  id: 1, job_id: 1,
+  started_at: '2024-06-01T10:00:00Z', ended_at: null,
+  entry_count: 2,
+}
+
+const MOCK_ENTRY = {
+  id: 1, session_id: 1,
+  asked_at: '2024-06-01T10:05:00Z',
+  question: 'Tell me about yourself.',
+  answer: 'I have 17 years of experience…',
+}
+
+describe('sessionsApi.list', () => {
+  it('GETs /api/sessions?job_id=N', async () => {
+    stubFetch([MOCK_SESSION])
+    await sessionsApi.list(1)
+    expect(fetch).toHaveBeenCalledWith('/api/sessions?job_id=1', expect.any(Object))
+  })
+})
+
+describe('sessionsApi.get', () => {
+  it('GETs /api/sessions/:id', async () => {
+    stubFetch({ ...MOCK_SESSION, entries: [] })
+    await sessionsApi.get(1)
+    expect(fetch).toHaveBeenCalledWith('/api/sessions/1', expect.any(Object))
+  })
+})
+
+describe('sessionsApi.create', () => {
+  it('POSTs to /api/sessions with job_id', async () => {
+    stubFetch(MOCK_SESSION, 201)
+    await sessionsApi.create(1)
+    expect(fetch).toHaveBeenCalledWith(
+      '/api/sessions',
+      expect.objectContaining({ method: 'POST', body: JSON.stringify({ job_id: 1 }) }),
+    )
+  })
+})
+
+describe('sessionsApi.remove', () => {
+  it('DELETEs /api/sessions/:id', async () => {
+    stubFetch(null, 204)
+    await sessionsApi.remove(1)
+    expect(fetch).toHaveBeenCalledWith(
+      '/api/sessions/1',
+      expect.objectContaining({ method: 'DELETE' }),
+    )
+  })
+})
+
+describe('sessionsApi.bulkRemove', () => {
+  it('DELETEs /api/sessions with ids body', async () => {
+    stubFetch(null, 204)
+    await sessionsApi.bulkRemove([1, 2, 3])
+    expect(fetch).toHaveBeenCalledWith(
+      '/api/sessions',
+      expect.objectContaining({ method: 'DELETE', body: JSON.stringify({ ids: [1, 2, 3] }) }),
+    )
+  })
+})
+
+describe('sessionsApi.addEntry', () => {
+  it('POSTs to /api/sessions/:id/entries', async () => {
+    stubFetch(MOCK_ENTRY, 201)
+    const payload = { question: 'Q?', answer: 'A.' }
+    await sessionsApi.addEntry(1, payload)
+    expect(fetch).toHaveBeenCalledWith(
+      '/api/sessions/1/entries',
+      expect.objectContaining({ method: 'POST', body: JSON.stringify(payload) }),
     )
   })
 })

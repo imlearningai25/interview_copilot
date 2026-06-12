@@ -4,7 +4,7 @@ from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy import func
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 
 from ..database import get_db
 from ..models import Job, QAEntry, Session as SessionModel
@@ -58,7 +58,12 @@ def list_sessions(job_id: Optional[int] = None, db: Session = Depends(get_db)):
 
 @router.get("/{session_id}", response_model=SessionResponse)
 def get_session(session_id: int, db: Session = Depends(get_db)):
-    session = db.get(SessionModel, session_id)
+    session = (
+        db.query(SessionModel)
+        .options(joinedload(SessionModel.entries))
+        .filter(SessionModel.id == session_id)
+        .first()
+    )
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
     return session

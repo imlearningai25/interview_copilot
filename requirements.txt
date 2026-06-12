@@ -8,7 +8,7 @@
 #   Windows: pip install pyaudio      (usually works directly)
 #   Linux:   sudo apt install python3-pyaudio portaudio19-dev
 
-anthropic>=0.25.0
+anthropic>=0.28.0
 SpeechRecognition>=3.10.0
 pyaudio>=0.2.13
 vosk>=0.3.45

@@ -19,6 +19,7 @@ function setup(jobOverrides = {}, handlers = {}) {
     onEdit: vi.fn(),
     onDelete: vi.fn(),
     onActivate: vi.fn(),
+    onSessions: vi.fn(),
     ...handlers,
   }
   render(<JobCard {...props} />)
@@ -95,5 +96,12 @@ describe('JobCard — callbacks', () => {
     const { onDelete } = setup()
     await user.click(screen.getByRole('button', { name: 'Delete' }))
     expect(onDelete).toHaveBeenCalledWith(BASE_JOB.id)
+  })
+
+  it('calls onSessions with full job object', async () => {
+    const user = userEvent.setup()
+    const { onSessions } = setup()
+    await user.click(screen.getByRole('button', { name: 'Sessions' }))
+    expect(onSessions).toHaveBeenCalledWith(expect.objectContaining({ id: BASE_JOB.id }))
   })
 })

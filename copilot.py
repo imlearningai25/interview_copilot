@@ -18,6 +18,7 @@ import re
 import queue
 import threading
 import datetime
+import time
 import tkinter as tk
 from tkinter import scrolledtext
 from difflib import SequenceMatcher
@@ -42,23 +43,41 @@ JOB_CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "job_
 # Web app API base URL — set COPILOT_API_URL to point at prod
 _API_BASE = os.getenv("COPILOT_API_URL", "http://localhost:4001")
 
+# Singleton Anthropic client — created once, reused across all calls
+_anthropic_client = None
+_anthropic_key    = None
+
+def _get_client(api_key: str):
+    global _anthropic_client, _anthropic_key
+    if _anthropic_client is None or _anthropic_key != api_key:
+        import anthropic
+        _anthropic_client = anthropic.Anthropic(api_key=api_key)
+        _anthropic_key = api_key
+    return _anthropic_client
+
+# Job config cache — refreshed at most every 60 s to avoid per-question HTTP round-trips
+_job_cache: dict = {"data": {}, "ts": 0.0}
 
 def load_job_config() -> dict:
     """Fetch active job from the web app API; fall back to local job_config.json."""
+    global _job_cache
+    if time.monotonic() - _job_cache["ts"] < 60:
+        return _job_cache["data"]
+    result: dict = {}
     try:
         url = f"{_API_BASE}/api/jobs/active"
         with urllib.request.urlopen(url, timeout=3) as resp:
-            return json.loads(resp.read().decode())
+            result = json.loads(resp.read().decode())
     except Exception:
         pass
-    # Fallback: local file written by the old job_setup.py
-    if os.path.exists(JOB_CONFIG_FILE):
+    if not result and os.path.exists(JOB_CONFIG_FILE):
         try:
             with open(JOB_CONFIG_FILE, encoding="utf-8") as f:
-                return json.load(f)
+                result = json.load(f)
         except Exception:
             pass
-    return {}
+    _job_cache.update({"data": result, "ts": time.monotonic()})
+    return result
 
 
 def build_job_context(job: dict) -> str:
@@ -196,19 +215,22 @@ def get_ai_response(question: str, config: dict, on_chunk=None) -> str:
             on_chunk(msg)
         return msg
     try:
-        import anthropic
-        client = anthropic.Anthropic(api_key=api_key)
+        client = _get_client(api_key)
         job = load_job_config()
         job_context = build_job_context(job)
         target_role = job.get("role") or config.get("role", "professional")
         prompt = SYSTEM_PROMPT.format(role=target_role)
         if job_context:
             prompt = prompt.replace("=== END RESUME ===", f"=== END RESUME ===\n{job_context}")
+        # Cache the large system prompt across calls — saves ~300ms per question
+        system_block = [{"type": "text", "text": prompt,
+                          "cache_control": {"type": "ephemeral"}}]
         kwargs = dict(
             model=config["model"],
             max_tokens=400,
-            system=prompt,
-            messages=[{"role": "user", "content": f'Interviewer said: "{question}"'}],
+            system=system_block,
+            messages=[{"role": "user",
+                        "content": f'Interviewer said (speech recognition — infer intended meaning if garbled): "{question}"'}],
         )
         if on_chunk:
             with client.messages.stream(**kwargs) as stream:
@@ -477,9 +499,10 @@ class DiarizedVoskListener(VoskAudioListener):
     state machine consistent) but transcripts are suppressed.
     """
 
-    EMBED_WINDOW    = 32_000  # samples — 2 s at 16 kHz
+    EMBED_WINDOW    = 48_000  # samples — 3 s at 16 kHz (less frequent, more stable)
     SIM_THRESHOLD   = 0.50   # enter "user" state above this
     SIM_HOLD        = 0.42   # stay "user" while above this (hysteresis)
+    _DEBUG          = bool(os.getenv("COPILOT_DEBUG"))
 
     def __init__(self, out_q: queue.Queue, config: dict,
                  model_path: str, user_embedding):
@@ -487,6 +510,30 @@ class DiarizedVoskListener(VoskAudioListener):
         self.user_embedding   = user_embedding
         self._embed_buf       = b""
         self._speaker_is_user = False
+        # Single-slot queue — drops a new buffer if embedding is still running
+        self._embed_q: queue.Queue = queue.Queue(maxsize=1)
+
+    def _embed_worker(self, encoder):
+        """Background thread: consume buffers, update speaker state."""
+        import numpy as np
+        from resemblyzer import preprocess_wav
+        while True:
+            raw_bytes = self._embed_q.get()
+            if raw_bytes is None:
+                break
+            try:
+                raw = np.frombuffer(raw_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+                wav = preprocess_wav(raw, source_sr=self.RATE)
+                emb = encoder.embed_utterance(wav)
+                sims = self.user_embedding @ emb
+                sim  = float(np.max(sims))
+                threshold = self.SIM_HOLD if self._speaker_is_user else self.SIM_THRESHOLD
+                self._speaker_is_user = sim > threshold
+                if self._DEBUG:
+                    label = "YOU  (filtered)" if self._speaker_is_user else "OTHER (passing)"
+                    print(f"[diarize] sim={sim:.3f} thr={threshold:.2f} → {label}", flush=True)
+            except Exception:
+                pass
 
     def _loop(self):
         try:
@@ -500,8 +547,7 @@ class DiarizedVoskListener(VoskAudioListener):
             self.q.put(("error", "pyaudio not installed.\nRun:  pip install pyaudio"))
             return
         try:
-            import numpy as np
-            from resemblyzer import VoiceEncoder, preprocess_wav
+            from resemblyzer import VoiceEncoder
             encoder = VoiceEncoder()
         except ImportError:
             self.q.put(("error", "resemblyzer not installed.\nRun:  pip install resemblyzer"))
@@ -511,6 +557,11 @@ class DiarizedVoskListener(VoskAudioListener):
         if self._model is None:
             self._model = Model(self.model_path)
 
+        # Start dedicated embedding thread so audio collection is never stalled
+        embed_thread = threading.Thread(target=self._embed_worker,
+                                        args=(encoder,), daemon=True)
+        embed_thread.start()
+
         rec    = KaldiRecognizer(self._model, self.RATE)
         pa     = _pa.PyAudio()
         stream = pa.open(format=_pa.paInt16, channels=1, rate=self.RATE,
@@ -519,21 +570,13 @@ class DiarizedVoskListener(VoskAudioListener):
             while self._running:
                 data = stream.read(self.CHUNK, exception_on_overflow=False)
 
-                # Every 2 s, re-evaluate who is speaking
+                # Accumulate audio; every 3 s submit to embedding thread (non-blocking)
                 self._embed_buf += data
                 if len(self._embed_buf) >= self.EMBED_WINDOW * 2:  # int16 = 2 bytes
-                    raw = np.frombuffer(self._embed_buf, dtype=np.int16
-                                        ).astype(np.float32) / 32768.0
-                    wav = preprocess_wav(raw, source_sr=self.RATE)
-                    emb = encoder.embed_utterance(wav)
-                    # user_embedding is (N, 256); take max similarity across all chunks
-                    sims = self.user_embedding @ emb  # shape (N,)
-                    sim  = float(np.max(sims))
-                    # Hysteresis: easier to stay "user" than to enter that state
-                    threshold = self.SIM_HOLD if self._speaker_is_user else self.SIM_THRESHOLD
-                    self._speaker_is_user = sim > threshold
-                    label = "YOU  (filtered)" if self._speaker_is_user else "OTHER (passing)"
-                    print(f"[diarize] sim={sim:.3f} (of {len(sims)} chunks)  thr={threshold:.2f}  → {label}", flush=True)
+                    try:
+                        self._embed_q.put_nowait(self._embed_buf)
+                    except queue.Full:
+                        pass  # embedding still running — drop this window, try next
                     self._embed_buf = b""
 
                 # Always feed Vosk so its internal state stays consistent
@@ -548,6 +591,7 @@ class DiarizedVoskListener(VoskAudioListener):
                         if text:
                             self.q.put(("partial", text + "…"))
         finally:
+            self._embed_q.put(None)  # signal worker to exit
             stream.stop_stream()
             stream.close()
             pa.terminate()
@@ -585,36 +629,6 @@ def _is_question(text: str) -> bool:
     if _QUESTION_ANYWHERE.search(t):   # search, not match — works anywhere in sentence
         return True
     return False
-
-
-def _correct_transcript(text: str, config: dict) -> str:
-    """Fix speech-recognition errors using Claude.
-
-    Handles accent-related mishearings like 'govt measurity' → 'governance maturity'
-    by using context to infer the intended words. Returns original text on any failure.
-    """
-    api_key = config.get("api_key", "")
-    if not api_key:
-        return text
-    try:
-        import anthropic
-        client = anthropic.Anthropic(api_key=api_key)
-        msg = client.messages.create(
-            model=config["model"],
-            max_tokens=120,
-            system=(
-                "You correct speech recognition output that may contain errors due to "
-                "accent or microphone quality. Fix misrecognized or garbled words so the "
-                "sentence is grammatically correct and meaningful in a professional or "
-                "technical interview context. "
-                "Return ONLY the corrected sentence — no explanation, no extra punctuation."
-            ),
-            messages=[{"role": "user", "content": text}],
-        )
-        corrected = msg.content[0].text.strip()
-        return corrected if corrected else text
-    except Exception:
-        return text
 
 
 # ─── AI worker ────────────────────────────────────────────────
@@ -676,14 +690,13 @@ class AIWorker:
                     if not self._is_new_question(content):
                         continue
                     self._last_raw_question = content
-                    corrected = _correct_transcript(content, self.cfg)
-                    self._last_question = corrected
-                    self.oq.put(("stream_start", corrected))
+                    self._last_question = content
+                    self.oq.put(("stream_start", content))
                     _chunks: list[str] = []
                     def _on_chunk(t, _c=_chunks):
                         _c.append(t)
                         self.oq.put(("chunk", t))
-                    get_ai_response(corrected, self.cfg, on_chunk=_on_chunk)
+                    get_ai_response(content, self.cfg, on_chunk=_on_chunk)
                     self._last_answer = "".join(_chunks)
                     self.oq.put(("stream_done", None))
                 elif kind == "partial":
