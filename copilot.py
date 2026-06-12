@@ -22,6 +22,7 @@ from tkinter import scrolledtext
 from difflib import SequenceMatcher
 import urllib.request
 
+
 try:
     from pynput import keyboard as _kb
     _HAS_PYNPUT = True
@@ -284,6 +285,41 @@ class AudioListener:
                     pass
 
 
+VOICE_ENROLLMENT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "user_voice.npy")
+ENROLL_SECONDS = 5
+
+
+def _load_user_embedding():
+    """Load saved voice embedding. Returns numpy array or None."""
+    try:
+        import numpy as np
+        from resemblyzer import VoiceEncoder  # verify installed
+        if os.path.exists(VOICE_ENROLLMENT_PATH):
+            return np.load(VOICE_ENROLLMENT_PATH)
+    except ImportError:
+        pass
+    return None
+
+
+def _record_and_embed(seconds: int = ENROLL_SECONDS, rate: int = 16_000, chunk: int = 4_000):
+    """Record mic audio for `seconds` seconds and return a resemblyzer embedding."""
+    import numpy as np
+    from resemblyzer import VoiceEncoder, preprocess_wav
+    import pyaudio as _pa
+
+    pa = _pa.PyAudio()
+    stream = pa.open(format=_pa.paInt16, channels=1, rate=rate,
+                     input=True, frames_per_buffer=chunk)
+    frames = []
+    for _ in range(int(rate / chunk * seconds)):
+        frames.append(stream.read(chunk, exception_on_overflow=False))
+    stream.stop_stream(); stream.close(); pa.terminate()
+
+    raw = np.frombuffer(b"".join(frames), dtype=np.int16).astype(np.float32) / 32768.0
+    wav = preprocess_wav(raw, source_sr=rate)
+    return VoiceEncoder().embed_utterance(wav)
+
+
 # ─── Vosk real-time audio listener ───────────────────────────
 
 def _find_vosk_model(config: dict) -> str:
@@ -395,6 +431,85 @@ class VoskAudioListener:
             pa.terminate()
 
 
+# ─── Speaker-filtered Vosk listener ─────────────────────────
+
+class DiarizedVoskListener(VoskAudioListener):
+    """VoskAudioListener that silences audio segments matching the enrolled user voice.
+
+    Uses resemblyzer to compare each 2-second audio window against the user's
+    saved embedding. Windows that match the user are fed to Vosk (to keep its
+    state machine consistent) but transcripts are suppressed.
+    """
+
+    EMBED_WINDOW   = 32_000   # samples — 2 s at 16 kHz
+    SIM_THRESHOLD  = 0.75     # cosine similarity above this → user's voice
+
+    def __init__(self, out_q: queue.Queue, config: dict,
+                 model_path: str, user_embedding):
+        super().__init__(out_q, config, model_path)
+        self.user_embedding  = user_embedding
+        self._embed_buf      = b""
+        self._speaker_is_user = False
+
+    def _loop(self):
+        try:
+            from vosk import Model, KaldiRecognizer
+        except ImportError:
+            self.q.put(("error", "vosk not installed.\nRun:  pip install vosk"))
+            return
+        try:
+            import pyaudio as _pa
+        except ImportError:
+            self.q.put(("error", "pyaudio not installed.\nRun:  pip install pyaudio"))
+            return
+        try:
+            import numpy as np
+            from resemblyzer import VoiceEncoder, preprocess_wav
+            encoder = VoiceEncoder()
+        except ImportError:
+            self.q.put(("error", "resemblyzer not installed.\nRun:  pip install resemblyzer"))
+            return
+        import json as _json
+
+        if self._model is None:
+            self._model = Model(self.model_path)
+
+        rec    = KaldiRecognizer(self._model, self.RATE)
+        pa     = _pa.PyAudio()
+        stream = pa.open(format=_pa.paInt16, channels=1, rate=self.RATE,
+                         input=True, frames_per_buffer=self.CHUNK)
+        try:
+            while self._running:
+                data = stream.read(self.CHUNK, exception_on_overflow=False)
+
+                # Every 2 s, re-evaluate who is speaking
+                self._embed_buf += data
+                if len(self._embed_buf) >= self.EMBED_WINDOW * 2:  # int16 = 2 bytes
+                    raw = np.frombuffer(self._embed_buf, dtype=np.int16
+                                        ).astype(np.float32) / 32768.0
+                    wav = preprocess_wav(raw, source_sr=self.RATE)
+                    emb = encoder.embed_utterance(wav)
+                    sim = float(np.dot(emb, self.user_embedding))
+                    self._speaker_is_user = sim > self.SIM_THRESHOLD
+                    self._embed_buf = b""
+
+                # Always feed Vosk so its internal state stays consistent
+                if rec.AcceptWaveform(data):
+                    if not self._speaker_is_user and not self._paused:
+                        text = _json.loads(rec.Result()).get("text", "").strip()
+                        if text:
+                            self.q.put(("transcript", text))
+                else:
+                    if not self._speaker_is_user and not self._paused:
+                        text = _json.loads(rec.PartialResult()).get("partial", "").strip()
+                        if text:
+                            self.q.put(("partial", text + "…"))
+        finally:
+            stream.stop_stream()
+            stream.close()
+            pa.terminate()
+
+
 # ─── Question detection ───────────────────────────────────────
 # Matches question phrases anywhere in the sentence (handles openers like
 # "let's move on...", "so...", "I'd like to know..." before the actual ask).
@@ -429,6 +544,36 @@ def _is_question(text: str) -> bool:
     return False
 
 
+def _correct_transcript(text: str, config: dict) -> str:
+    """Fix speech-recognition errors using Claude.
+
+    Handles accent-related mishearings like 'govt measurity' → 'governance maturity'
+    by using context to infer the intended words. Returns original text on any failure.
+    """
+    api_key = config.get("api_key", "")
+    if not api_key:
+        return text
+    try:
+        import anthropic
+        client = anthropic.Anthropic(api_key=api_key)
+        msg = client.messages.create(
+            model=config["model"],
+            max_tokens=120,
+            system=(
+                "You correct speech recognition output that may contain errors due to "
+                "accent or microphone quality. Fix misrecognized or garbled words so the "
+                "sentence is grammatically correct and meaningful in a professional or "
+                "technical interview context. "
+                "Return ONLY the corrected sentence — no explanation, no extra punctuation."
+            ),
+            messages=[{"role": "user", "content": text}],
+        )
+        corrected = msg.content[0].text.strip()
+        return corrected if corrected else text
+    except Exception:
+        return text
+
+
 # ─── AI worker ────────────────────────────────────────────────
 class AIWorker:
     """Reads transcripts, calls AI, pushes responses."""
@@ -439,7 +584,9 @@ class AIWorker:
         self.cfg = config
         self._running = False
         self._thread = None
-        self._last_question = ""
+        self._last_raw_question = ""  # raw transcript for dedup
+        self._last_question = ""      # corrected question
+        self._last_answer = ""
 
     def start(self):
         self._running = True
@@ -449,28 +596,56 @@ class AIWorker:
     def stop(self):
         self._running = False
 
-    def _is_new_question(self, text: str) -> bool:
-        if not self._last_question:
+    def _is_new_question(self, raw: str) -> bool:
+        if not self._last_raw_question:
             return True
-        ratio = SequenceMatcher(None, self._last_question.lower(), text.lower()).ratio()
+        ratio = SequenceMatcher(None, self._last_raw_question.lower(), raw.lower()).ratio()
         return ratio < 0.75
+
+    def _is_reading_answer(self, text: str) -> bool:
+        """Return True if the transcript looks like the user reading the last AI answer aloud."""
+        if not self._last_answer:
+            return False
+        t = text.lower()
+        a = self._last_answer.lower()
+        # Direct sequence similarity (catches near-identical short reads)
+        if SequenceMatcher(None, t, a).ratio() > 0.35:
+            return True
+        # Word-overlap: if most content words in the transcript exist in the answer
+        t_words = [w for w in t.split() if len(w) > 3]
+        if len(t_words) >= 4:
+            a_words = set(a.split())
+            overlap = sum(1 for w in t_words if w in a_words)
+            if overlap / len(t_words) > 0.65:
+                return True
+        return False
 
     def _loop(self):
         while self._running:
             try:
                 kind, content = self.iq.get(timeout=1)
                 if kind == "transcript":
+                    if self._is_reading_answer(content):
+                        continue  # user is reading the AI response aloud — ignore
                     if not _is_question(content):
                         self.oq.put(("not_question", content))
                         continue
                     if not self._is_new_question(content):
                         continue
-                    self._last_question = content
-                    self.oq.put(("stream_start", content))
-                    get_ai_response(content, self.cfg, on_chunk=lambda t: self.oq.put(("chunk", t)))
+                    self._last_raw_question = content
+                    corrected = _correct_transcript(content, self.cfg)
+                    self._last_question = corrected
+                    self.oq.put(("stream_start", corrected))
+                    _chunks: list[str] = []
+                    def _on_chunk(t, _c=_chunks):
+                        _c.append(t)
+                        self.oq.put(("chunk", t))
+                    get_ai_response(corrected, self.cfg, on_chunk=_on_chunk)
+                    self._last_answer = "".join(_chunks)
                     self.oq.put(("stream_done", None))
                 elif kind == "partial":
-                    self.oq.put(("partial", content))
+                    if not self._is_reading_answer(content.rstrip("…")):
+                        self.oq.put(("partial", content))
                 elif kind == "error":
                     self.oq.put(("error", content))
             except queue.Empty:
@@ -488,8 +663,11 @@ class CopilotOverlay:
         self.transcript_q: queue.Queue = queue.Queue()   # AudioListener → AIWorker
         self.response_q:   queue.Queue = queue.Queue()   # AIWorker → UI
 
-        vosk_path = _find_vosk_model(config)
-        if vosk_path:
+        vosk_path  = _find_vosk_model(config)
+        user_emb   = _load_user_embedding()
+        if vosk_path and user_emb is not None:
+            self.listener = DiarizedVoskListener(self.transcript_q, config, vosk_path, user_emb)
+        elif vosk_path:
             self.listener = VoskAudioListener(self.transcript_q, config, vosk_path)
         else:
             self.listener = AudioListener(self.transcript_q, config)
@@ -499,11 +677,12 @@ class CopilotOverlay:
         # Drag state
         self._drag_x = 0
         self._drag_y = 0
-
         self._kb_listener = None
 
         self._build_ui()
         self._start_keyboard_listener()
+        # Start listening immediately when the window opens
+        self.root.after(500, self._toggle_listen)
 
     # ── Build UI ──────────────────────────────────────────────
     def _build_ui(self):
@@ -625,6 +804,12 @@ class CopilotOverlay:
                   bd=0, padx=8, pady=6, cursor="hand2",
                   command=self._settings).pack(side="right", padx=4)
 
+        tk.Button(ctrl, text="👤 Enroll",
+                  bg=c["panel"], fg=c["dim"],
+                  font=("Helvetica", 10),
+                  bd=0, padx=8, pady=6, cursor="hand2",
+                  command=self._enroll_voice_dialog).pack(side="right", padx=4)
+
     # ── Drag support ──────────────────────────────────────────
     def _drag_start(self, e):
         self._drag_x, self._drag_y = e.x, e.y
@@ -691,11 +876,14 @@ class CopilotOverlay:
         self.response_q.put(("stream_start", text))
         self.root.after(0, self._drain_once)
 
+        _chunks: list[str] = []
         def on_chunk(chunk):
+            _chunks.append(chunk)
             self.response_q.put(("chunk", chunk))
             self.root.after(0, self._drain_once)
 
         get_ai_response(text, self.cfg, on_chunk=on_chunk)
+        self.ai_worker._last_answer = "".join(_chunks)
         self.response_q.put(("stream_done", None))
         self.root.after(0, self._drain_once)
 
@@ -839,44 +1027,98 @@ class CopilotOverlay:
 
     # ── Stop mic after answer; keyboard resumes ───────────────
     def _pause_after_answer(self):
-        self._listening = False
-        self.listener.stop()
-        self.ai_worker.stop()
-        self.listen_btn.config(text="▶  Start Listening", bg=self.c["green"])
-        self._set_status("✅  Answer ready — press Space to listen again", "green")
         self._set_heard("")
+        self._set_status("✅  Answer ready — listening for next question…", "green")
+        # Revert to listening indicator after 3 s
+        self.root.after(3000, lambda: self._set_status("🎤  Listening…", "green") if self._listening else None)
 
-    # ── Global keyboard toggle ────────────────────────────────
+    # ── Voice enrollment ──────────────────────────────────────
+    def _enroll_voice_dialog(self):
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Voice Enrollment")
+        dlg.geometry("380x180")
+        dlg.configure(bg=self.c["bg"])
+        dlg.wm_attributes("-topmost", True)
+        dlg.grab_set()
+
+        tk.Label(dlg,
+                 text="Speak naturally for 5 seconds after clicking Start.\n"
+                      "The system will learn your voice and filter it out\n"
+                      "so only the interviewer's speech triggers answers.",
+                 bg=self.c["bg"], fg=self.c["text"],
+                 font=("Helvetica", 10), justify="center").pack(padx=12, pady=(14, 6))
+
+        status_lbl = tk.Label(dlg, text="", bg=self.c["bg"], fg=self.c["yellow"],
+                              font=("Helvetica", 10, "bold"))
+        status_lbl.pack(pady=2)
+
+        btn = tk.Button(dlg, text="🎤  Start Recording",
+                        bg=self.c["green"], fg=self.c["btn_fg"],
+                        font=("Helvetica", 10, "bold"), bd=0, padx=14, pady=5,
+                        cursor="hand2")
+        btn.pack(pady=8)
+
+        def _countdown(n):
+            if n > 0:
+                status_lbl.config(text=f"🎤  Recording… {n}s remaining")
+                dlg.after(1000, lambda: _countdown(n - 1))
+            else:
+                status_lbl.config(text="⏳  Processing…")
+
+        def _do_record():
+            btn.config(state="disabled")
+            was_listening = self._listening
+            if was_listening:
+                self._listening = False
+                self.listener.stop()
+                self.ai_worker.stop()
+
+            _countdown(ENROLL_SECONDS)
+
+            def _record_thread():
+                try:
+                    import numpy as np
+                    embedding = _record_and_embed()
+                    np.save(VOICE_ENROLLMENT_PATH, embedding)
+                    vosk_path = _find_vosk_model(self.cfg)
+                    if vosk_path:
+                        self.listener = DiarizedVoskListener(
+                            self.transcript_q, self.cfg, vosk_path, embedding)
+                    self.root.after(0, lambda: status_lbl.config(
+                        text="✅  Enrolled! Speaker filtering is now active.",
+                        fg=self.c["green"]))
+                    self.root.after(0, lambda: btn.config(
+                        text="Re-enroll", state="normal"))
+                except Exception as exc:
+                    self.root.after(0, lambda: status_lbl.config(
+                        text=f"❌  {exc}", fg=self.c["red"]))
+                    self.root.after(0, lambda: btn.config(state="normal"))
+                finally:
+                    if was_listening:
+                        self.root.after(200, self._restart_listening)
+
+            threading.Thread(target=_record_thread, daemon=True).start()
+
+        btn.config(command=_do_record)
+
+    def _restart_listening(self):
+        if not self._listening:
+            self._listening = True
+            self.listener.start()
+            self.ai_worker.start()
+            self._poll()
+
+    # ── Up-arrow: answer whatever is in the HEARD panel ──────
     def _start_keyboard_listener(self):
         if not _HAS_PYNPUT:
             return
 
-        _space_held = set()
-
         def _on_press(key):
-            if key == _kb.Key.space:
-                if key in _space_held:
-                    return          # key-repeat — ignore
-                _space_held.add(key)
-                self.root.after(0, self._keyboard_toggle)
-            elif key == _kb.Key.up:
+            if key == _kb.Key.up:
                 self.root.after(0, self._answer_current_question)
 
-        def _on_release(key):
-            _space_held.discard(key)
-
-        self._kb_listener = _kb.Listener(
-            on_press=_on_press, on_release=_on_release, daemon=True
-        )
+        self._kb_listener = _kb.Listener(on_press=_on_press, daemon=True)
         self._kb_listener.start()
-
-    def _keyboard_toggle(self):
-        # Don't toggle while a dialog (Toplevel) is open — user may be typing
-        for w in self.root.winfo_children():
-            if isinstance(w, tk.Toplevel) and w.winfo_exists():
-                return
-        self._set_heard("")
-        self._toggle_listen()
 
     def _answer_current_question(self):
         # Don't act while a dialog is open
@@ -886,12 +1128,6 @@ class CopilotOverlay:
         text = self.heard_txt.get("1.0", "end-1c").strip().rstrip("…").strip()
         if not text:
             return
-        # Stop listening first
-        if self._listening:
-            self._listening = False
-            self.listener.stop()
-            self.ai_worker.stop()
-            self.listen_btn.config(text="▶  Start Listening", bg=self.c["green"])
         self._handle_manual(text)
 
     # ── Lifecycle ─────────────────────────────────────────────

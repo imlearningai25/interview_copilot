@@ -18,6 +18,9 @@ copilot.log
 # Vosk models — large binary files, download separately
 vosk-model-*/
 
+# Voice enrollment — personal biometric data, never commit
+user_voice.npy
+
 # Frontend
 frontend/node_modules/
 
@@ -30,4 +33,6 @@ terraform/*.tfplan
 terraform/crash.log
 # NOTE: terraform/.terraform.lock.hcl SHOULD be committed (locks provider versions)
 
+# Claude Code project settings (local permissions, not portable)
+.claude/
 interview_copilot/*.*
