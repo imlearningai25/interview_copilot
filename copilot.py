@@ -843,30 +843,27 @@ class CopilotOverlay:
         self.listener.stop()
         self.ai_worker.stop()
         self.listen_btn.config(text="▶  Start Listening", bg=self.c["green"])
-        self._set_status("✅  Answer ready — press any key to listen again", "green")
+        self._set_status("✅  Answer ready — press Space to listen again", "green")
+        self._set_heard("")
 
     # ── Global keyboard toggle ────────────────────────────────
     def _start_keyboard_listener(self):
         if not _HAS_PYNPUT:
             return
 
-        _held = set()
-
-        def _key_id(key):
-            try:
-                return key.char or str(key)
-            except AttributeError:
-                return str(key)
+        _space_held = set()
 
         def _on_press(key):
-            kid = _key_id(key)
-            if kid in _held:
-                return              # key-repeat — ignore
-            _held.add(kid)
-            self.root.after(0, self._keyboard_toggle)
+            if key == _kb.Key.space:
+                if key in _space_held:
+                    return          # key-repeat — ignore
+                _space_held.add(key)
+                self.root.after(0, self._keyboard_toggle)
+            elif key == _kb.Key.up:
+                self.root.after(0, self._answer_current_question)
 
         def _on_release(key):
-            _held.discard(_key_id(key))
+            _space_held.discard(key)
 
         self._kb_listener = _kb.Listener(
             on_press=_on_press, on_release=_on_release, daemon=True
@@ -880,6 +877,22 @@ class CopilotOverlay:
                 return
         self._set_heard("")
         self._toggle_listen()
+
+    def _answer_current_question(self):
+        # Don't act while a dialog is open
+        for w in self.root.winfo_children():
+            if isinstance(w, tk.Toplevel) and w.winfo_exists():
+                return
+        text = self.heard_txt.get("1.0", "end-1c").strip().rstrip("…").strip()
+        if not text:
+            return
+        # Stop listening first
+        if self._listening:
+            self._listening = False
+            self.listener.stop()
+            self.ai_worker.stop()
+            self.listen_btn.config(text="▶  Start Listening", bg=self.c["green"])
+        self._handle_manual(text)
 
     # ── Lifecycle ─────────────────────────────────────────────
     def _quit(self):
