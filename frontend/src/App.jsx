@@ -3,6 +3,7 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { jobsApi } from './api'
 import JobCard from './components/JobCard'
 import JobForm from './components/JobForm'
+import SessionsModal from './components/SessionsModal'
 
 const LAUNCHER_URL = import.meta.env.VITE_LAUNCHER_URL || 'http://localhost:4004'
 
@@ -20,9 +21,10 @@ export default function App() {
   const qc = useQueryClient()
   const { toasts, add: toast } = useToast()
 
-  const [showForm,   setShowForm]   = useState(false)
-  const [editingJob, setEditingJob] = useState(null)
-  const [launching,  setLaunching]  = useState(false)
+  const [showForm,        setShowForm]        = useState(false)
+  const [editingJob,      setEditingJob]      = useState(null)
+  const [launching,       setLaunching]       = useState(false)
+  const [sessionsJob,     setSessionsJob]     = useState(null)
 
   const { data: jobs = [], isLoading, isError } = useQuery({
     queryKey: ['jobs'],
@@ -169,6 +171,7 @@ export default function App() {
               onEdit={handleEdit}
               onDelete={handleDelete}
               onActivate={id => activateMut.mutate(id)}
+              onSessions={setSessionsJob}
             />
           ))}
         </div>
@@ -185,6 +188,15 @@ export default function App() {
             />
           </div>
         </div>
+      )}
+
+      {/* ── Sessions modal ── */}
+      {sessionsJob && (
+        <SessionsModal
+          job={sessionsJob}
+          onClose={() => setSessionsJob(null)}
+          onToast={toast}
+        />
       )}
     </div>
   )

@@ -17,6 +17,7 @@ import json
 import re
 import queue
 import threading
+import datetime
 import tkinter as tk
 from tkinter import scrolledtext
 from difflib import SequenceMatcher
@@ -286,23 +287,37 @@ class AudioListener:
 
 
 VOICE_ENROLLMENT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "user_voice.npy")
-ENROLL_SECONDS = 5
+ENROLL_SECONDS = 15
 
 
 def _load_user_embedding():
-    """Load saved voice embedding. Returns numpy array or None."""
+    """Load saved voice embeddings. Returns 2-D array (N, 256) or None.
+
+    Handles both old format (1-D, single embedding) and new format (2-D,
+    multiple chunk embeddings) so existing user_voice.npy files still work.
+    """
     try:
         import numpy as np
         from resemblyzer import VoiceEncoder  # verify installed
         if os.path.exists(VOICE_ENROLLMENT_PATH):
-            return np.load(VOICE_ENROLLMENT_PATH)
+            arr = np.load(VOICE_ENROLLMENT_PATH)
+            if arr.ndim == 1:
+                arr = arr[np.newaxis, :]  # upgrade old single-embedding files
+            return arr
     except ImportError:
         pass
     return None
 
 
-def _record_and_embed(seconds: int = ENROLL_SECONDS, rate: int = 16_000, chunk: int = 4_000):
-    """Record mic audio for `seconds` seconds and return a resemblyzer embedding."""
+def _record_and_embed(seconds: int = ENROLL_SECONDS, rate: int = 16_000,
+                      chunk: int = 4_000, window_sec: int = 3):
+    """Record mic audio for `seconds` and return a 2-D embedding array (N, 256).
+
+    Audio is split into non-overlapping `window_sec`-second chunks; each chunk
+    gets its own embedding.  Storing multiple embeddings instead of one averaged
+    vector makes the similarity comparison far more robust against variation in
+    speaking style, volume, and silence distribution.
+    """
     import numpy as np
     from resemblyzer import VoiceEncoder, preprocess_wav
     import pyaudio as _pa
@@ -311,13 +326,34 @@ def _record_and_embed(seconds: int = ENROLL_SECONDS, rate: int = 16_000, chunk: 
     stream = pa.open(format=_pa.paInt16, channels=1, rate=rate,
                      input=True, frames_per_buffer=chunk)
     frames = []
-    for _ in range(int(rate / chunk * seconds)):
+    total_chunks = int(rate / chunk * seconds)
+    for _ in range(total_chunks):
         frames.append(stream.read(chunk, exception_on_overflow=False))
     stream.stop_stream(); stream.close(); pa.terminate()
 
-    raw = np.frombuffer(b"".join(frames), dtype=np.int16).astype(np.float32) / 32768.0
-    wav = preprocess_wav(raw, source_sr=rate)
-    return VoiceEncoder().embed_utterance(wav)
+    full_raw = np.frombuffer(b"".join(frames), dtype=np.int16).astype(np.float32) / 32768.0
+    encoder  = VoiceEncoder()
+
+    # Split into window_sec-second segments and embed each one individually
+    window_samples = rate * window_sec
+    embeddings = []
+    for start in range(0, len(full_raw) - window_samples + 1, window_samples):
+        segment = full_raw[start: start + window_samples]
+        try:
+            wav = preprocess_wav(segment, source_sr=rate)
+            emb = encoder.embed_utterance(wav)
+            embeddings.append(emb)
+        except Exception:
+            pass  # skip silent/bad segments
+
+    if not embeddings:
+        # Fallback: embed the whole recording
+        wav = preprocess_wav(full_raw, source_sr=rate)
+        embeddings.append(encoder.embed_utterance(wav))
+
+    result = np.array(embeddings)   # shape (N, 256)
+    print(f"[enroll] saved {len(embeddings)} chunk embedding(s) from {seconds}s recording", flush=True)
+    return result
 
 
 # ─── Vosk real-time audio listener ───────────────────────────
@@ -441,14 +477,15 @@ class DiarizedVoskListener(VoskAudioListener):
     state machine consistent) but transcripts are suppressed.
     """
 
-    EMBED_WINDOW   = 32_000   # samples — 2 s at 16 kHz
-    SIM_THRESHOLD  = 0.75     # cosine similarity above this → user's voice
+    EMBED_WINDOW    = 32_000  # samples — 2 s at 16 kHz
+    SIM_THRESHOLD   = 0.50   # enter "user" state above this
+    SIM_HOLD        = 0.42   # stay "user" while above this (hysteresis)
 
     def __init__(self, out_q: queue.Queue, config: dict,
                  model_path: str, user_embedding):
         super().__init__(out_q, config, model_path)
-        self.user_embedding  = user_embedding
-        self._embed_buf      = b""
+        self.user_embedding   = user_embedding
+        self._embed_buf       = b""
         self._speaker_is_user = False
 
     def _loop(self):
@@ -489,8 +526,14 @@ class DiarizedVoskListener(VoskAudioListener):
                                         ).astype(np.float32) / 32768.0
                     wav = preprocess_wav(raw, source_sr=self.RATE)
                     emb = encoder.embed_utterance(wav)
-                    sim = float(np.dot(emb, self.user_embedding))
-                    self._speaker_is_user = sim > self.SIM_THRESHOLD
+                    # user_embedding is (N, 256); take max similarity across all chunks
+                    sims = self.user_embedding @ emb  # shape (N,)
+                    sim  = float(np.max(sims))
+                    # Hysteresis: easier to stay "user" than to enter that state
+                    threshold = self.SIM_HOLD if self._speaker_is_user else self.SIM_THRESHOLD
+                    self._speaker_is_user = sim > threshold
+                    label = "YOU  (filtered)" if self._speaker_is_user else "OTHER (passing)"
+                    print(f"[diarize] sim={sim:.3f} (of {len(sims)} chunks)  thr={threshold:.2f}  → {label}", flush=True)
                     self._embed_buf = b""
 
                 # Always feed Vosk so its internal state stays consistent
@@ -679,6 +722,10 @@ class CopilotOverlay:
         self._drag_y = 0
         self._kb_listener = None
 
+        # Session history — created lazily on first Q&A (needs active job id)
+        self._current_question = ""
+        self._session_id: int | None = None
+
         self._build_ui()
         self._start_keyboard_listener()
         # Start listening immediately when the window opens
@@ -810,6 +857,12 @@ class CopilotOverlay:
                   bd=0, padx=8, pady=6, cursor="hand2",
                   command=self._enroll_voice_dialog).pack(side="right", padx=4)
 
+        tk.Button(ctrl, text="📂 Session",
+                  bg=c["panel"], fg=c["dim"],
+                  font=("Helvetica", 10),
+                  bd=0, padx=8, pady=6, cursor="hand2",
+                  command=self._open_session).pack(side="right", padx=4)
+
     # ── Drag support ──────────────────────────────────────────
     def _drag_start(self, e):
         self._drag_x, self._drag_y = e.x, e.y
@@ -898,6 +951,7 @@ class CopilotOverlay:
             while True:
                 kind, payload = self.response_q.get_nowait()
                 if kind == "stream_start":
+                    self._current_question = payload
                     self._set_heard(payload)
                     self._append_divider(payload)
                     self._set_status("🤔  Thinking…", "yellow")
@@ -909,6 +963,8 @@ class CopilotOverlay:
                     self._set_heard(payload)
                     self._set_status("🎤  Listening…", "green")
                 elif kind == "stream_done":
+                    self._save_to_history(self._current_question,
+                                          self.ai_worker._last_answer)
                     self._pause_after_answer()
                 elif kind == "status" and payload == "thinking":
                     self._set_status("🤔  Thinking…", "yellow")
@@ -936,21 +992,16 @@ class CopilotOverlay:
         old = self.answer_txt.get("1.0", "end-1c").strip()
         self.answer_txt.delete("1.0", "end")
 
+        ts      = datetime.datetime.now().strftime("%H:%M")
         divider = "─" * 38
+        header  = divider + "\n[" + ts + "] Q: " + question + "\n\n"
 
         if old:
-            # Insert old history first, then put the new header above it.
-            # This way the mark (set after both inserts) sits at a fixed
-            # position between the header and the old block — RIGHT gravity
-            # then lets each streaming chunk land to the LEFT of the mark
-            # (before it), advancing the mark downward in correct order.
             self.answer_txt.insert("1.0", "\n" + divider + "\n" + old)
-            self.answer_txt.insert("1.0", divider + "\nQ: " + question + "\n\n")
-            # Header occupies lines 1-3 (divider / Q: / blank).
-            # Line 4 is the blank line that precedes the old-history separator.
+            self.answer_txt.insert("1.0", header)
             self.answer_txt.mark_set("stream_here", "4.0")
         else:
-            self.answer_txt.insert("1.0", divider + "\nQ: " + question + "\n\n")
+            self.answer_txt.insert("1.0", header)
             self.answer_txt.mark_set("stream_here", "end")
 
         self.answer_txt.mark_gravity("stream_here", "right")
@@ -1029,8 +1080,55 @@ class CopilotOverlay:
     def _pause_after_answer(self):
         self._set_heard("")
         self._set_status("✅  Answer ready — listening for next question…", "green")
-        # Revert to listening indicator after 3 s
         self.root.after(3000, lambda: self._set_status("🎤  Listening…", "green") if self._listening else None)
+
+    # ── Session history (API-backed) ──────────────────────────
+    def _ensure_session(self) -> int | None:
+        """Create a DB session for the active job on first call; return session id."""
+        if self._session_id is not None:
+            return self._session_id
+        try:
+            job = load_job_config()
+            job_id = job.get("id")
+            if not job_id:
+                return None
+            url = f"{_API_BASE}/api/sessions"
+            data = json.dumps({"job_id": job_id}).encode()
+            req = urllib.request.Request(url, data=data,
+                                         headers={"Content-Type": "application/json"},
+                                         method="POST")
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                self._session_id = json.loads(resp.read().decode())["id"]
+                print(f"[session] created session {self._session_id} for job {job_id}", flush=True)
+                return self._session_id
+        except Exception as exc:
+            print(f"[session] could not create session: {exc}", flush=True)
+            return None
+
+    def _save_to_history(self, question: str, answer: str):
+        if not question or not answer:
+            return
+        threading.Thread(target=self._post_entry, args=(question, answer), daemon=True).start()
+
+    def _post_entry(self, question: str, answer: str):
+        session_id = self._ensure_session()
+        if not session_id:
+            return
+        try:
+            url = f"{_API_BASE}/api/sessions/{session_id}/entries"
+            data = json.dumps({"question": question, "answer": answer}).encode()
+            req = urllib.request.Request(url, data=data,
+                                         headers={"Content-Type": "application/json"},
+                                         method="POST")
+            with urllib.request.urlopen(req, timeout=5):
+                pass
+            print(f"[session] entry saved to session {session_id}", flush=True)
+        except Exception as exc:
+            print(f"[session] entry save failed: {exc}", flush=True)
+
+    def _open_session(self):
+        import webbrowser
+        webbrowser.open(f"http://localhost:4002")
 
     # ── Voice enrollment ──────────────────────────────────────
     def _enroll_voice_dialog(self):
@@ -1042,9 +1140,9 @@ class CopilotOverlay:
         dlg.grab_set()
 
         tk.Label(dlg,
-                 text="Speak naturally for 5 seconds after clicking Start.\n"
-                      "The system will learn your voice and filter it out\n"
-                      "so only the interviewer's speech triggers answers.",
+                 text="Speak naturally for 15 seconds after clicking Start.\n"
+                      "Keep talking — say anything aloud in your normal voice.\n"
+                      "Only the interviewer's speech will then trigger answers.",
                  bg=self.c["bg"], fg=self.c["text"],
                  font=("Helvetica", 10), justify="center").pack(padx=12, pady=(14, 6))
 

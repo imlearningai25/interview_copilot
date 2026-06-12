@@ -21,6 +21,9 @@ vosk-model-*/
 # Voice enrollment — personal biometric data, never commit
 user_voice.npy
 
+# Session history — contains interview Q&A, keep local
+sessions/
+
 # Frontend
 frontend/node_modules/
 

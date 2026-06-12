@@ -1,4 +1,4 @@
-export default function JobCard({ job, onEdit, onDelete, onActivate }) {
+export default function JobCard({ job, onEdit, onDelete, onActivate, onSessions }) {
   const preview = job.job_description
     ? job.job_description.slice(0, 160) + (job.job_description.length > 160 ? '…' : '')
     : null
@@ -24,6 +24,7 @@ export default function JobCard({ job, onEdit, onDelete, onActivate }) {
               Set Active
             </button>
           )}
+          <button className="btn-sm btn-sessions" onClick={() => onSessions(job)}>Sessions</button>
           <button className="btn-sm btn-edit" onClick={() => onEdit(job)}>Edit</button>
           <button className="btn-sm btn-delete" onClick={() => onDelete(job.id)}>Delete</button>
         </div>

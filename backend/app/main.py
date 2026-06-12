@@ -5,6 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from .config import get_settings
 from .database import engine, Base
 from .routers import jobs
+from .routers import sessions
 
 
 @asynccontextmanager
@@ -34,6 +35,7 @@ def create_app() -> FastAPI:
     )
 
     app.include_router(jobs.router, prefix=settings.api_prefix)
+    app.include_router(sessions.router)
 
     @app.get("/health", tags=["health"])
     def health():
